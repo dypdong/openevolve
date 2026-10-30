@@ -22,7 +22,7 @@
 
 ---
 
-## Why OpenEvolve?
+## Why OpenEvolve-BX?
 
 <table>
 <tr>
