@@ -8,6 +8,7 @@ from openevolve.llm.openai import OpenAILLM
 from openevolve.llm.claude_code import ClaudeCodeLLM, init_claude_code_client
 from openevolve.llm.copilot_cli import CopilotCLILLM, init_copilot_cli_client
 from openevolve.llm.codex_app_server import CodexAppServerLLM, init_codex_app_server_client
+from openevolve.llm.opencode_cli2 import OpencodeLLM, init_opencode_client
 
 __all__ = [
     "LLMInterface",
@@ -18,5 +19,7 @@ __all__ = [
     "init_copilot_cli_client",
     "CodexAppServerLLM",
     "init_codex_app_server_client",
+    "OpencodeLLM",
+    "init_opencode_client",
     "LLMEnsemble",
 ]

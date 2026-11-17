@@ -40,6 +40,13 @@ try:
 except ImportError:
     pass
 
+try:
+    from openevolve.llm.opencode_cli2 import OpencodeLLM
+
+    _PROVIDER_REGISTRY["opencode"] = lambda cfg: OpencodeLLM(cfg)
+except ImportError:
+    pass
+
 
 def _create_model(model_cfg: LLMModelConfig) -> LLMInterface:
     if model_cfg.init_client:

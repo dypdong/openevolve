@@ -194,10 +194,12 @@ class OpenAILLM(LLMInterface):
             return await self._manual_wait_for_answer(params, timeout=timeout)
 
         timeout = kwargs.get("timeout", self.timeout)
+        use_stream = kwargs.get("stream", True)
 
         for attempt in range(retries + 1):
             try:
-                response = await asyncio.wait_for(self._call_api(params), timeout=timeout)
+                call = self._call_api_stream if use_stream else self._call_api
+                response = await asyncio.wait_for(call(params), timeout=timeout)
                 return response
             except asyncio.TimeoutError:
                 if attempt < retries:
@@ -258,6 +260,63 @@ class OpenAILLM(LLMInterface):
             logger.info(f"LLM Token Usage ({self.model}): usage info not returned by API")
 
         return response.choices[0].message.content
+
+    async def _call_api_stream(self, params: Dict[str, Any]) -> str:
+        """Make a streaming API call and return the concatenated response text."""
+        if self.client is None:
+            raise RuntimeError("OpenAI client is not initialized (manual_mode enabled?)")
+
+        request_params = dict(params)
+        # 配置思考模式
+        # reasoning_effort = request_params.get("reasoning_effort", self.reasoning_effort)
+        # if reasoning_effort is not None:
+        #     request_params["reasoning_effort"] = reasoning_effort
+        stream_options = dict(request_params.get("stream_options") or {})
+        stream_options["include_usage"] = True
+        request_params["stream_options"] = stream_options
+        stream = await self.client.chat.completions.create(**request_params, stream=True)
+        content_parts: List[str] = []
+        usage = None
+        logger.debug(f"API parameters: {request_params}")
+
+        async for chunk in stream:
+            choices = getattr(chunk, "choices", None) or []
+            if choices:
+                delta = getattr(choices[0], "delta", None)
+                text = getattr(delta, "content", None) if delta is not None else None
+                if text:
+                    content_parts.append(text)
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage is not None:
+                usage = chunk_usage
+
+        if usage is not None:
+            prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+            completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+            total_tokens = getattr(usage, "total_tokens", 0) or (prompt_tokens + completion_tokens)
+            completion_details = getattr(usage, "completion_tokens_details", None)
+            reasoning_tokens = getattr(completion_details, "reasoning_tokens", 0)
+            self.last_usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+                "model": str(self.model),
+            }
+
+            logger.info(
+                f"LLM Token Usage ({self.model}): "
+                f"prompt_tokens={prompt_tokens}, "
+                f"completion_tokens={completion_tokens}, "
+                f"reasoning_tokens={reasoning_tokens}, "
+                f"total_tokens={total_tokens}"
+            )
+        else:
+            self.last_usage = None
+            logger.info(f"LLM Token Usage ({self.model}): usage info not returned by API")
+
+        result = "".join(content_parts)
+        logger.debug(f"API response ({self.model}): {result}")
+        return result
 
     async def _manual_wait_for_answer(
         self, params: Dict[str, Any], timeout: Optional[Union[int, float]]
