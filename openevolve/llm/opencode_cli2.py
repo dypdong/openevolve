@@ -93,7 +93,7 @@ LOG = logging.getLogger("opencode_client")
  
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4096
-DEFAULT_TIMEOUT = 600.0          # agent 带工具调用时可能跑很久
+DEFAULT_TIMEOUT = 1200.0          # agent 带工具调用时可能跑很久
 DEFAULT_RETRIES = 2
 DEFAULT_BACKOFF = 1.0
 RETRY_STATUS = frozenset({429, 502, 503, 504})
@@ -108,7 +108,7 @@ DEFAULT_ALLOWED_TOOLS: tuple[str, ...] = (
 OPENCODE_DEFAULT_BASE_URL = "http://127.0.0.1:4096"
 OPENCODE_DEFAULT_API = "v2"
 OPENCODE_DEFAULT_MODEL = "deepseek/deepseek-flash"
-OPENCODE_DEFAULT_TIMEOUT = 600.0
+OPENCODE_DEFAULT_TIMEOUT = 1200.0
 OPENCODE_DEFAULT_RETRIES = 3
 OPENCODE_DEFAULT_RETRY_DELAY = 5.0
 OPENCODE_DEFAULT_USERNAME = "opencode"
@@ -356,7 +356,7 @@ class _ApiV2(_Adapter):
     """opencode >= 2.0：/api/session + /api/session/{id}/prompt。
  
     V2 的模型在创建 session 时确定，prompt 只接受 {"text": ...}。
-    permission / agent 的字段形状尚未验证，沿用 V1 形状并在被拒时自动降级。
+    permissions 为 [{action, resource, effect}]；空 allow_tools = 禁用全部工具，被拒时自动降级。
     """
  
     name = "v2"
@@ -375,10 +375,11 @@ class _ApiV2(_Adapter):
             body["model"] = model.to_v2()
         if agent:
             body["agent"] = agent
-        if allow_tools:
-            body["permission"] = {
-                "rules": [{"toolName": t, "action": "allow"} for t in allow_tools]
-            }
+        # V2 权限：Permission.Ruleset = [{action, resource, effect}]。
+        # 空 allow_tools = 禁用全部工具（纯文本生成）；否则 deny 全部再放行指定工具。
+        rules = [{"action": "*", "resource": "*", "effect": "deny"}]
+        rules += [{"action": t, "resource": "*", "effect": "allow"} for t in allow_tools]
+        body["permissions"] = rules
         return body
  
     def prompt_path(self, session_id: str) -> str:
@@ -644,7 +645,7 @@ class OpencodeClient:
         )
  
         # 可选字段被拒时逐级降级，避免一个未验证的字段让整批任务失败。
-        optional = ["permission", "agent"]
+        optional = ["permissions", "agent"]
         while True:
             try:
                 return self._create_session_call(adapter, body)
@@ -739,12 +740,31 @@ class OpencodeClient:
             if own_session and ephemeral:
                 self._quiet_delete(sid)
 
+    @staticmethod
+    def _assistant_text(msg: Mapping[str, Any]) -> str:
+        """拼接 assistant 消息里所有 text 部分的文本（流式/工具调用消息可能为空）。"""
+        texts: list[str] = []
+        for part in msg.get("content") or []:
+            if isinstance(part, Mapping) and part.get("type") == "text":
+                texts.append(part.get("text") or "")
+        return "".join(texts)
+
     def _collect_v2_turn(self, session_id: str, deadline: float) -> TurnResult:
-        """V2：prompt 是异步投递，这里轮询消息列表直到拿到 assistant 回复。"""
+        """V2：prompt 是异步投递，轮询消息直到拿到 assistant 回复，并等 agent 循环
+        进入 idle 后再返回。否则 ask() 紧接着删除会话，会与 agent 循环收尾产生竞态，
+        服务端对已删除会话的 GET 会报 404。"""
         poll_interval = 0.5
+        idle_grace = 5.0  # 拿到 assistant 回复后，给 idle 消息的宽限窗口（秒）
+        assistant_msg = None
+        idle_grace_until = None
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            now = time.monotonic()
+            if assistant_msg is not None and idle_grace_until is not None and now >= idle_grace_until:
+                # 宽限期到仍未 idle，直接返回已拿到的回复（避免无限等待）
+                return self._assistant_message_to_turn(session_id, assistant_msg)
+            if now >= deadline:
+                if assistant_msg is not None:
+                    return self._assistant_message_to_turn(session_id, assistant_msg)
                 raise TimeoutError(
                     f"opencode V2 未在期限内产出 assistant 回复 (session {session_id})"
                 )
@@ -752,13 +772,14 @@ class OpencodeClient:
                 "GET",
                 f"/api/session/{session_id}/message",
                 params={"order": "desc", "limit": "20"},
-                timeout=remaining,
+                timeout=deadline - now,
             )
             payload = _decode(resp)
             if isinstance(payload, Mapping):
                 messages = payload.get("data") or []
             else:
                 messages = []
+            idle_done = False
             for msg in messages:
                 if not isinstance(msg, Mapping):
                     continue
@@ -768,12 +789,21 @@ class OpencodeClient:
                         err = msg["error"]
                         detail = err.get("message") if isinstance(err, Mapping) else err
                         raise RuntimeError(f"opencode V2 assistant error: {detail}")
-                    if msg.get("finish") or (msg.get("time") or {}).get("completed"):
-                        return self._assistant_message_to_turn(session_id, msg)
-                elif mtype == "idle" and msg.get("outcome") in ("failed", "interrupted"):
-                    err = msg.get("error") or {}
-                    detail = err.get("message") if isinstance(err, Mapping) else err
-                    raise RuntimeError(f"opencode V2 turn {msg.get('outcome')}: {detail}")
+                    if assistant_msg is None and (msg.get("finish") or (msg.get("time") or {}).get("completed")) and self._assistant_text(msg):
+                        assistant_msg = msg
+                elif mtype == "idle":
+                    outcome = msg.get("outcome")
+                    if outcome == "succeeded":
+                        idle_done = True
+                    elif outcome in ("failed", "interrupted"):
+                        err = msg.get("error") or {}
+                        detail = err.get("message") if isinstance(err, Mapping) else err
+                        raise RuntimeError(f"opencode V2 turn {outcome}: {detail}")
+            if assistant_msg is not None:
+                if idle_done:
+                    return self._assistant_message_to_turn(session_id, assistant_msg)
+                if idle_grace_until is None:
+                    idle_grace_until = now + idle_grace
             time.sleep(poll_interval)
 
     def _assistant_message_to_turn(
@@ -1291,6 +1321,8 @@ class OpencodeLLM(LLMInterface):
             raise RuntimeError("Empty response from opencode")
 
         self.last_usage = _normalize_usage(result.usage, self.model) if result.usage else None
+        LOG.info("Response model: %s usage%s",self.model, self.last_usage)
+        LOG.info("Response text: %s ",result.text)
         return result.text
 
 
